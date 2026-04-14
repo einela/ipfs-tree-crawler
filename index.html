@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IPFS Tree Crawler (WASM)</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+         background: #0d1117; color: #c9d1d9; padding: 2rem; }
+  h1 { color: #58a6ff; margin-bottom: 1rem; font-size: 1.4rem; }
+  .input-row { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }
+  input { flex: 1; padding: 0.6rem; background: #161b22; border: 1px solid #30363d;
+          color: #c9d1d9; border-radius: 6px; font-size: 0.95rem; }
+  button { padding: 0.6rem 1.2rem; background: #238636; color: #fff; border: none;
+           border-radius: 6px; cursor: pointer; font-weight: 600; }
+  button:disabled { background: #484f58; cursor: not-allowed; }
+  #status { margin-bottom: 1rem; color: #8b949e; font-size: 0.85rem; }
+  #tree { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+          padding: 1rem; max-height: 70vh; overflow: auto; font-size: 0.85rem; line-height: 1.6; }
+  .dir  { color: #58a6ff; }
+  .file { color: #c9d1d9; }
+  .size { color: #8b949e; margin-left: 0.4em; }
+</style>
+</head>
+<body>
+
+<h1>IPFS Directory Tree Crawler</h1>
+
+<div class="input-row">
+  <input id="cidInput" type="text"
+         placeholder="Enter IPFS CID (v0 or v1)..." />
+  <button id="fetchBtn">Fetch Tree</button>
+  <button id="jsonBtn" style="background:#1f6feb; display:none;">
+    Copy JSON
+  </button>
+</div>
+
+<div id="status">Ready. Enter a CID to begin.</div>
+<div id="tree"></div>
+
+<script type="module">
+  import init, {
+    initPanicHook,
+    fetchIpfsTree,
+    fetchIpfsTreeJson,
+    normalizeCid,
+    getCidCodec,
+    setGateway,
+    setConcurrency,
+    clearCaches,
+    clearTreeCache,
+  } from './pkg/ipfs_wasm.js';
+
+  const cidInput   = document.getElementById('cidInput');
+  const fetchBtn   = document.getElementById('fetchBtn');
+  const jsonBtn    = document.getElementById('jsonBtn');
+  const statusEl   = document.getElementById('status');
+  const treeEl     = document.getElementById('tree');
+
+  let lastJson = null;
+
+  await init();
+  initPanicHook();
+
+  // Optional: customize gateway / concurrency
+  // setGateway("https://ipfs.io");
+  // setConcurrency(32);
+
+  function renderNode(node, depth = 0) {
+    const indent = '  '.repeat(depth);
+    if (node[1] instanceof Array && typeof node[1][0] !== 'number') {
+      const name = node[0] || '/';
+      let html = `<div class="dir">${indent}📁 ${esc(name)}/</div>`;
+      for (const child of node[1]) {
+        html += renderNode(child, depth + 1);
+      }
+      return html;
+    } else {
+      const name = node[0];
+      const size = formatSize(node[1]);
+      return `<div class="file">${indent}📄 ${esc(name)}<span class="size">${size}</span></div>`;
+    }
+  }
+
+  function formatSize(bytes) {
+    if (bytes == null) return '';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / 1048576).toFixed(2) + ' MB';
+    return (bytes / 1073741824).toFixed(2) + ' GB';
+  }
+
+  function esc(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  function countNodes(node) {
+    if (!node || !Array.isArray(node)) return 0;
+    if (node[1] instanceof Array && typeof node[1][0] !== 'number') {
+      let c = 0;
+      for (const child of node[1]) c += countNodes(child);
+      return c;
+    }
+    return 1;
+  }
+
+  fetchBtn.addEventListener('click', async () => {
+    const cid = cidInput.value.trim();
+    if (!cid) return;
+
+    fetchBtn.disabled = true;
+    statusEl.textContent = `Validating CID...`;
+
+    const norm = normalizeCid(cid);
+    if (!norm) {
+      statusEl.textContent = `❌ Invalid CID: ${cid}`;
+      fetchBtn.disabled = false;
+      return;
+    }
+    const codec = getCidCodec(cid);
+    statusEl.textContent = `✅ CID valid (${codec}). Fetching tree...`;
+    treeEl.innerHTML = '';
+    jsonBtn.style.display = 'none';
+    lastJson = null;
+
+    const t0 = performance.now();
+    try {
+      // fetchIpfsTree caches the result internally
+      const tree = await fetchIpfsTree(cid);
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+      const fileCount = countNodes(tree);
+
+      treeEl.innerHTML = renderNode(tree);
+
+      // fetchIpfsTreeJson reuses the cached tree — no double fetch!
+      lastJson = await fetchIpfsTreeJson(cid);
+      jsonBtn.style.display = '';
+      statusEl.textContent = `✅ Done in ${elapsed}s — ${fileCount} files found`;
+    } catch (e) {
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+      const msg = typeof e === 'string' ? e : (e.message || e);
+      statusEl.textContent = `❌ Error after ${elapsed}s: ${msg}`;
+      console.error(e);
+    } finally {
+      clearCaches();
+      clearTreeCache();
+      fetchBtn.disabled = false;
+    }
+  });
+
+  cidInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') fetchBtn.click();
+  });
+
+  jsonBtn.addEventListener('click', () => {
+    if (lastJson) {
+      navigator.clipboard.writeText(lastJson)
+        .then(() => { jsonBtn.textContent = 'Copied!'; setTimeout(() => jsonBtn.textContent = 'Copy JSON', 1500); })
+        .catch(() => {
+          const ta = document.createElement('textarea');
+          ta.value = lastJson;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+          jsonBtn.textContent = 'Copied!'; setTimeout(() => jsonBtn.textContent = 'Copy JSON', 1500);
+        });
+    }
+  });
+</script>
+
+</body>
+</html>
